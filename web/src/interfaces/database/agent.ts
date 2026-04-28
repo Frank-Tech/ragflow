@@ -87,6 +87,7 @@ export declare interface IFlow {
 export interface IFlowTemplate {
   avatar: string;
   canvas_type: string;
+  canvas_types?: string[];
   create_date: string;
   create_time: number;
   canvas_category?: string;
@@ -296,6 +297,7 @@ export interface IPipeLineListRequest {
   orderby?: string;
   desc?: boolean;
   canvas_category?: AgentCategory;
+  ext?: string;
 }
 
 export interface GlobalVariableType {
