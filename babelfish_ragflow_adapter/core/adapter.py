@@ -26,7 +26,7 @@ import os
 import uuid
 from typing import AsyncGenerator, Dict, List
 
-from babelfish_adapter.core.context import babelfish_context, _current_session_id, _current_flow_id
+from babelfish_ragflow_adapter.core.context import babelfish_context, _current_session_id, _current_flow_id
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗

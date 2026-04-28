@@ -120,7 +120,7 @@ class Base(ABC):
         # resulting trace to the correct flow/session. The adapter sets
         # babelfish_context in a ContextVar before invoking the Canvas; we
         # read it here at client construction time. See
-        # babelfish_adapter/core/context.py for the protocol.
+        # babelfish_ragflow_adapter/core/context.py for the protocol.
         #
         # CRITICAL: clients must be constructed fresh per invocation (do NOT
         # memoize at module/class/tenant level) — cached clients would carry
@@ -129,7 +129,7 @@ class Base(ABC):
         bf_default_headers = None
         bf_base_url = None
         try:
-            from babelfish_adapter.core.context import (
+            from babelfish_ragflow_adapter.core.context import (
                 babelfish_context as _bf_ctx,
                 _current_session_id as _current_sid,
                 _current_flow_id as _current_fid,
@@ -144,7 +144,7 @@ class Base(ABC):
                     "X-Auto-Approve": "true",
                 }
         except ImportError:
-            # babelfish_adapter isn't installed → ragflow runs normally.
+            # babelfish_ragflow_adapter isn't installed → ragflow runs normally.
             pass
         # ────────────────────────────────────────────────────────────────────
         if bf_default_headers is not None:
