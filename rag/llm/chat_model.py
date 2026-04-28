@@ -112,8 +112,52 @@ def _apply_model_family_policies(
 class Base(ABC):
     def __init__(self, key, model_name, base_url, **kwargs):
         timeout = int(os.environ.get("LLM_TIMEOUT_SECONDS", 600))
-        self.client = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
-        self.async_client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout)
+        # ── babelfish routing (lexus-test integration) ──────────────────────
+        # When the babelfish adapter is active and mode == "babelfish", route
+        # every OpenAI call through the nexus proxy instead of the provider's
+        # base_url, and inject the babelfish headers so holy-grail can tag the
+        # resulting trace to the correct flow/session. The adapter sets
+        # babelfish_context in a ContextVar before invoking the Canvas; we
+        # read it here at client construction time. See
+        # babelfish_adapter/core/context.py for the protocol.
+        #
+        # CRITICAL: clients must be constructed fresh per invocation (do NOT
+        # memoize at module/class/tenant level) — cached clients would carry
+        # stale X-Session-ID headers from the first run. Any caller that
+        # caches chat model instances across babelfish contexts is a bug.
+        bf_default_headers = None
+        bf_base_url = None
+        try:
+            from babelfish_adapter.core.context import (
+                babelfish_context as _bf_ctx,
+                _current_session_id as _current_sid,
+                _current_flow_id as _current_fid,
+            )
+            ctx = _bf_ctx.get()
+            if ctx and ctx.get("mode") == "babelfish":
+                bf_base_url = os.environ["OPENAI_BASE_URL"]
+                bf_default_headers = {
+                    "X-Session-ID": _current_sid.get() or "",
+                    "X-Flow-ID": _current_fid.get() or ctx["flow_id"],
+                    "X-Api-Key": os.environ["NEXUS_API_KEY"],
+                    "X-Auto-Approve": "true",
+                }
+        except ImportError:
+            # babelfish_adapter isn't installed → ragflow runs normally.
+            pass
+        # ────────────────────────────────────────────────────────────────────
+        if bf_default_headers is not None:
+            self.client = OpenAI(
+                api_key=key, base_url=bf_base_url, timeout=timeout,
+                default_headers=bf_default_headers,
+            )
+            self.async_client = AsyncOpenAI(
+                api_key=key, base_url=bf_base_url, timeout=timeout,
+                default_headers=bf_default_headers,
+            )
+        else:
+            self.client = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
+            self.async_client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout)
         self.model_name = model_name
         # Configure retry parameters
         self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 5)))
