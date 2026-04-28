@@ -35,7 +35,12 @@ import os
 import uuid as _uuid
 from typing import Optional, TypedDict
 
-from langchain_core.callbacks import BaseCallbackHandler
+try:
+    from langchain_core.callbacks import BaseCallbackHandler
+except ImportError:
+    # Ragflow doesn't use LangChain — the isolation handler is only needed
+    # for LangGraph-based projects (ASP). Provide a plain object fallback.
+    BaseCallbackHandler = object  # type: ignore[misc,assignment]
 
 
 class _CallbackIsolationHandler(BaseCallbackHandler):
@@ -49,6 +54,9 @@ class _CallbackIsolationHandler(BaseCallbackHandler):
     Passing a non-empty list (even with a no-op handler) forces LangChain
     to create a fresh ``CallbackManager`` with only our handlers, blocking
     inheritance from the parent.
+
+    In ragflow (which doesn't use LangChain), this class is never used —
+    the Canvas runtime has no callback inheritance to block.
     """
 
 
@@ -82,6 +90,10 @@ _current_session_id: contextvars.ContextVar[Optional[str]] = contextvars.Context
 
 _current_flow_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_current_flow_id", default=None
+)
+
+_current_client_trace_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_current_client_trace_id", default=None
 )
 
 

@@ -26,8 +26,9 @@ import os
 import uuid
 from typing import AsyncGenerator, Dict, List
 
-from babelfish_ragflow_adapter.core.context import babelfish_context, _current_session_id, _current_flow_id
-
+from babelfish_ragflow_adapter.core.context import (
+    babelfish_context, _current_session_id, _current_flow_id, _current_client_trace_id,
+)
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  PART 1: BABELFISH BOILERPLATE — KEEP AS-IS                            ║
@@ -38,18 +39,26 @@ from babelfish_ragflow_adapter.core.context import babelfish_context, _current_s
 
 
 def _build_langfuse_callbacks(trace_id: str) -> tuple[list, object | None]:
-    """Build Langfuse callbacks for the main flow's trace."""
+    """Build Langfuse callbacks for the main flow's trace.
+
+    For ragflow, the LangChain CallbackHandler is not available (no langchain
+    installed). Client tracing is handled via langfuse.openai's drop-in
+    AsyncOpenAI wrapper in LiteLLMBase._construct_completion_args().
+    This function returns empty when langchain isn't present.
+    """
     pub = os.environ.get("CLIENT_LANGFUSE_PUBLIC_KEY")
     sec = os.environ.get("CLIENT_LANGFUSE_SECRET_KEY")
     host = os.environ.get("CLIENT_LANGFUSE_HOST")
     if not (pub and sec and host):
         return [], None
-    from langfuse import Langfuse
-    from langfuse.langchain import CallbackHandler
-
-    Langfuse(public_key=pub, secret_key=sec, base_url=host)
-    handler = CallbackHandler(public_key=pub, trace_context={"trace_id": trace_id})
-    return [handler], handler
+    try:
+        from langfuse import Langfuse
+        from langfuse.langchain import CallbackHandler
+        Langfuse(public_key=pub, secret_key=sec, base_url=host)
+        handler = CallbackHandler(public_key=pub, trace_context={"trace_id": trace_id})
+        return [handler], handler
+    except (ImportError, ModuleNotFoundError):
+        return [], None
 
 
 async def run(
@@ -109,6 +118,24 @@ async def run(
 
     session_token = _current_session_id.set(parent_session_id)
     flow_id_token = _current_flow_id.set(flow_id)
+    trace_id_token = _current_client_trace_id.set(parent_client_trace_id)
+
+    # ── Langfuse client trace env bridging ──────────────────────────────
+    # langfuse.openai reads LANGFUSE_PUBLIC_KEY / SECRET_KEY / HOST from
+    # env. Our keys use the CLIENT_LANGFUSE_* prefix. Bridge them.
+    _langfuse_env_backup: dict[str, str | None] = {}
+    _lf_env_map = {
+        "LANGFUSE_PUBLIC_KEY": "CLIENT_LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY": "CLIENT_LANGFUSE_SECRET_KEY",
+        "LANGFUSE_HOST": "CLIENT_LANGFUSE_HOST",
+    }
+    for lf_key, client_key in _lf_env_map.items():
+        _langfuse_env_backup[lf_key] = os.environ.get(lf_key)
+        client_val = os.environ.get(client_key)
+        if client_val:
+            os.environ[lf_key] = client_val
+    # ──────────────────────────────────────────────────────────────────
+
     try:
         # ── This is the only line that calls ragflow's code ──
         async for step in execute_flow(
@@ -132,12 +159,22 @@ async def run(
             }
         }
     finally:
+        # Restore Langfuse env vars
+        for lf_key, prev_val in _langfuse_env_backup.items():
+            if prev_val is None:
+                os.environ.pop(lf_key, None)
+            else:
+                os.environ[lf_key] = prev_val
         for cb in callbacks:
             if hasattr(cb, "_langfuse_client"):
                 try:
                     cb._langfuse_client.flush()
                 except Exception:
                     pass
+        try:
+            _current_client_trace_id.reset(trace_id_token)
+        except ValueError:
+            _current_client_trace_id.set(None)
         try:
             _current_session_id.reset(session_token)
         except ValueError:
@@ -156,21 +193,147 @@ async def run(
 # ║  PART 2: PROJECT-SPECIFIC — RAGFLOW                                    ║
 # ║                                                                         ║
 # ║  Canvas registry, payloads, flow groups, execute_flow().                ║
-# ║  Filled in after the canvas event-shape spike confirms how to drive     ║
-# ║  ragflow's Canvas runtime in-process and what shape its events take.    ║
+# ║  Drives ragflow's Canvas runtime in-process using templates from        ║
+# ║  agent/templates/ with patched LLM IDs, tool API keys, and KB IDs.     ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
+import json
+import pathlib
 
-# TODO(spike): populated by inspect_canvas_events.py output. See:
-#   scripts/external_flows/ragflow/inspect_canvas_events.py
-#
-# Will define:
-#   _CANVASES        — entry_id → Canvas DSL JSON path
-#   _PAYLOADS        — entry_id → list of payload names
-#   _FLOW_GROUPS     — flow/subflow metadata for trace mapping
-#   execute_flow()   — async generator that drives Canvas in-process
-#   list_payloads()  — cross product of canvases × payloads
-#   list_flow_groups() — walks each canvas DSL to extract subflow system prompts
+# ── Template registry ─────────────────────────────────────────────────────────
+
+_TEMPLATES: Dict[str, str] = {
+    "trip_planner": "agent/templates/trip_planner.json",
+    "market_seo_article_writer": "agent/templates/market_seo_article_writer.json",
+    # stock_market_research_assistant excluded — requires YahooFinance component
+    # which has missing dependencies in the current ragflow checkout.
+    "deep_research": "agent/templates/deep_research.json",
+    "seo_article_writer": "agent/templates/seo_article_writer.json",
+    "web_search_assistant": "agent/templates/web_search_assistant.json",
+    "reflective_academic_paper_generator": "agent/templates/reflective_academic_paper_generator.json",
+    "user_interaction": "agent/templates/user_interaction.json",
+    "your_starter_dataset_chatbot": "agent/templates/your_starter_dataset_chatbot.json",
+    "data_analysis_beginner_assistant": "agent/templates/data_analysis_beginner_assistant.json",
+}
+
+_DEFAULT_QUERIES: Dict[str, str] = {
+    "trip_planner": "Plan a 3-day trip to Tokyo including food recommendations",
+    "market_seo_article_writer": "Write an SEO article about cloud security best practices",
+    "deep_research": "Research the latest developments in quantum computing",
+    "seo_article_writer": "Write an article about sustainable energy solutions",
+    "web_search_assistant": "What are the latest developments in fusion energy?",
+    "reflective_academic_paper_generator": "Write a paper outline on machine learning in cybersecurity",
+    "user_interaction": "How do I reset my password?",
+    "your_starter_dataset_chatbot": "What is your refund policy?",
+    "data_analysis_beginner_assistant": "Calculate the average of [10, 20, 30, 40, 50] and plot a bar chart",
+}
+
+# Tools to strip from web_search_assistant (require paid SerpApi key)
+_PAID_TOOLS = {"Google", "Bing", "SerpApi"}
+
+
+def _get_ragflow_repo() -> pathlib.Path:
+    """Resolve the ragflow repo path from env or default."""
+    return pathlib.Path(
+        os.environ.get("RAGFLOW_REPO", pathlib.Path.home() / "PycharmProjects" / "ragflow")
+    ).resolve()
+
+
+def _load_and_patch_dsl(entry_id: str) -> str:
+    """Load a template DSL, apply runtime patches, return JSON string.
+
+    Patches applied:
+    - llm_id override from RAGFLOW_LLM_ID
+    - Tavily API key injection from RAGFLOW_TAVILY_API_KEY
+    - KB ID injection from RAGFLOW_KB_FAQ / RAGFLOW_KB_RESEARCH
+    - Strip paid search tools from web_search_assistant
+    """
+    ragflow_repo = _get_ragflow_repo()
+    template_path = ragflow_repo / _TEMPLATES[entry_id]
+    with template_path.open() as f:
+        data = json.load(f)
+
+    # Unwrap template wrapper (DSL is nested under "dsl" key)
+    if "dsl" in data and "components" in data.get("dsl", {}):
+        data = data["dsl"]
+
+    if "components" not in data:
+        raise RuntimeError(f"Template {entry_id} has no 'components' key in DSL")
+
+    llm_override = os.environ.get("RAGFLOW_LLM_ID")
+    tavily_key = os.environ.get("RAGFLOW_TAVILY_API_KEY")
+    kb_faq = os.environ.get("RAGFLOW_KB_FAQ")
+    kb_research = os.environ.get("RAGFLOW_KB_RESEARCH")
+
+    for cpn_id, cpn in data["components"].items():
+        obj = cpn.get("obj", {})
+        params = obj.get("params", {})
+
+        # Override llm_id
+        if llm_override and "llm_id" in params:
+            params["llm_id"] = llm_override
+
+        # Patch tools
+        tools = params.get("tools", [])
+        patched_tools = []
+        for tool in tools:
+            tn = tool.get("component_name", "")
+            tp = tool.get("params", {})
+
+            # Strip paid search tools from web_search_assistant
+            if entry_id == "web_search_assistant" and tn in _PAID_TOOLS:
+                continue
+
+            # Inject Tavily API key
+            if tn in ("TavilySearch", "TavilyExtract") and tavily_key:
+                tp["api_key"] = tavily_key
+
+            # Override llm_id in nested Agent tools
+            if tn == "Agent" and llm_override and "llm_id" in tp:
+                tp["llm_id"] = llm_override
+
+            # Inject Tavily key in nested Agent tools' inner tools
+            for inner_tool in tp.get("tools", []):
+                itn = inner_tool.get("component_name", "")
+                itp = inner_tool.get("params", {})
+                if itn in ("TavilySearch", "TavilyExtract") and tavily_key:
+                    itp["api_key"] = tavily_key
+
+            patched_tools.append(tool)
+        params["tools"] = patched_tools
+
+        # Inject KB IDs for Retrieval tools
+        for tool in params.get("tools", []):
+            if tool.get("component_name") == "Retrieval":
+                tp = tool.get("params", {})
+                if not tp.get("dataset_ids") and not tp.get("kb_ids"):
+                    if entry_id == "reflective_academic_paper_generator":
+                        tp["dataset_ids"] = [kb_research] if kb_research else []
+                    else:
+                        tp["dataset_ids"] = [kb_faq] if kb_faq else []
+
+    return json.dumps(data)
+
+
+_settings_initialized = False
+
+
+def _ensure_ragflow_settings():
+    """Initialize ragflow settings once (loads service_conf.yaml, llm_factories, etc.)."""
+    global _settings_initialized
+    if _settings_initialized:
+        return
+    import sys
+    ragflow_repo = _get_ragflow_repo()
+    if str(ragflow_repo) not in sys.path:
+        sys.path.insert(0, str(ragflow_repo))
+    os.environ.setdefault("RAGFLOW_CONF_DIR", str(ragflow_repo / "conf"))
+    from common import settings
+    settings.init_settings()
+    _settings_initialized = True
+
+
+# ── Contract functions ────────────────────────────────────────────────────────
 
 
 async def execute_flow(
@@ -181,30 +344,80 @@ async def execute_flow(
 ) -> AsyncGenerator[dict, None]:
     """Run a ragflow Canvas and yield its event stream.
 
-    Implementation deferred until canvas spike completes — we need to know
-    the actual event dict shape Canvas produces before writing the translator.
+    Canvas events are yielded as-is — lexus-test extracts tool calls from
+    Langfuse traces (via langfuse.openai wrapper on the AsyncOpenAI client
+    in LiteLLMBase._construct_completion_args), not from the event stream.
+    The event stream just needs to flow without errors.
     """
-    raise NotImplementedError(
-        "execute_flow is pending the canvas event-shape spike. "
-        "Run scripts/external_flows/ragflow/inspect_canvas_events.py first."
-    )
-    # Unreachable — present so this stays a valid async generator function.
-    if False:
-        yield {}
+    entry_id, _, query_key = payload_name.partition(":")
+    if entry_id not in _TEMPLATES:
+        raise RuntimeError(f"Unknown entry_id: {entry_id}. Available: {list(_TEMPLATES.keys())}")
+
+    query = _DEFAULT_QUERIES.get(entry_id, "Hello")
+
+    _ensure_ragflow_settings()
+
+    dsl = _load_and_patch_dsl(entry_id)
+    tenant_id = os.environ.get("RAGFLOW_TENANT_ID", "adapter-tenant")
+
+    from agent.canvas import Canvas
+    canvas = Canvas(dsl=dsl, tenant_id=tenant_id)
+
+    async for event in canvas.run(query=query):
+        yield event
 
 
 def list_payloads() -> List[str]:
     """Return all testable payload names.
 
-    Format: "entry_id:payload_name". Implementation deferred — see PART 2 TODO.
+    Format: "entry_id:default" — one default payload per template.
     """
-    raise NotImplementedError("list_payloads pending PART 2 implementation")
+    return [f"{entry_id}:default" for entry_id in _TEMPLATES]
 
 
 def list_flow_groups() -> List[Dict]:
     """Return flow/subflow metadata for trace mapping.
 
-    Walks each canvas DSL to extract the parent flow's system prompt and any
-    nested-agent (subflow) system prompts. Implementation deferred — see PART 2.
+    Each template becomes one flow group. The first Agent component's
+    sys_prompt is the flow's system_message. Ragflow Canvas components
+    don't mint their own session_ids, so there are no subflows from the
+    babelfish identity perspective.
     """
-    raise NotImplementedError("list_flow_groups pending PART 2 implementation")
+    _ensure_ragflow_settings()
+
+    from agent.canvas import Canvas
+
+    groups = []
+    for entry_id, template_rel in _TEMPLATES.items():
+        dsl = _load_and_patch_dsl(entry_id)
+        tenant_id = os.environ.get("RAGFLOW_TENANT_ID", "adapter-tenant")
+
+        try:
+            canvas = Canvas(dsl=dsl, tenant_id=tenant_id)
+        except Exception as e:
+            raise RuntimeError(
+                f"Template '{entry_id}' failed to load: {type(e).__name__}: {e}"
+            ) from e
+
+        # Find the first Agent/LLM component's system prompt
+        flow_system_message = ""
+        for cpn_id, cpn_dict in canvas.components.items():
+            cpn_obj = cpn_dict["obj"]
+            if hasattr(cpn_obj, "_param") and hasattr(cpn_obj._param, "sys_prompt"):
+                if cpn_obj._param.sys_prompt:
+                    flow_system_message = cpn_obj._param.sys_prompt
+                    break
+
+        if not flow_system_message:
+            flow_system_message = f"ragflow:{entry_id}"
+
+        groups.append({
+            "entry_id": entry_id,
+            "flow": {
+                "name": entry_id,
+                "system_message": flow_system_message,
+            },
+            "subflows": [],
+        })
+
+    return groups
