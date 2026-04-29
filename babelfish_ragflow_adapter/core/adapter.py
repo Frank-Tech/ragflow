@@ -216,17 +216,21 @@ _TEMPLATES: Dict[str, str] = {
     "data_analysis_beginner_assistant": "agent/templates/data_analysis_beginner_assistant.json",
 }
 
-_DEFAULT_QUERIES: Dict[str, str] = {
-    "trip_planner": "Plan a 3-day trip to Tokyo including food recommendations",
-    "market_seo_article_writer": "Write an SEO article about cloud security best practices",
-    "deep_research": "Research the latest developments in quantum computing",
-    "seo_article_writer": "Write an article about sustainable energy solutions",
-    "web_search_assistant": "What are the latest developments in fusion energy?",
-    "reflective_academic_paper_generator": "Write a paper outline on machine learning in cybersecurity",
-    "user_interaction": "How do I reset my password?",
-    "your_starter_dataset_chatbot": "What is your refund policy?",
-    "data_analysis_beginner_assistant": "Calculate the average of [10, 20, 30, 40, 50] and plot a bar chart",
-}
+def _load_payloads() -> Dict[str, list[str]]:
+    """Load test payloads from payloads.json (20 queries per template)."""
+    payload_path = pathlib.Path(__file__).parent.parent / "payloads.json"
+    with payload_path.open() as f:
+        return json.load(f)
+
+
+_PAYLOADS: Dict[str, list[str]] | None = None
+
+
+def _get_payloads() -> Dict[str, list[str]]:
+    global _PAYLOADS
+    if _PAYLOADS is None:
+        _PAYLOADS = _load_payloads()
+    return _PAYLOADS
 
 # Tools to strip from web_search_assistant (require paid SerpApi key)
 _PAID_TOOLS = {"Google", "Bing", "SerpApi"}
@@ -349,11 +353,22 @@ async def execute_flow(
     in LiteLLMBase._construct_completion_args), not from the event stream.
     The event stream just needs to flow without errors.
     """
-    entry_id, _, query_key = payload_name.partition(":")
+    entry_id, _, payload_index = payload_name.partition(":")
     if entry_id not in _TEMPLATES:
         raise RuntimeError(f"Unknown entry_id: {entry_id}. Available: {list(_TEMPLATES.keys())}")
 
-    query = _DEFAULT_QUERIES.get(entry_id, "Hello")
+    payloads = _get_payloads()
+    entry_payloads = payloads.get(entry_id, [])
+    try:
+        idx = int(payload_index)
+    except (ValueError, TypeError):
+        idx = 0
+    if idx < 0 or idx >= len(entry_payloads):
+        raise RuntimeError(
+            f"Payload index {idx} out of range for {entry_id} "
+            f"(has {len(entry_payloads)} payloads)"
+        )
+    query = entry_payloads[idx]
 
     _ensure_ragflow_settings()
 
@@ -370,9 +385,15 @@ async def execute_flow(
 def list_payloads() -> List[str]:
     """Return all testable payload names.
 
-    Format: "entry_id:default" — one default payload per template.
+    Format: "entry_id:index" — 20 payloads per template (180 total).
     """
-    return [f"{entry_id}:default" for entry_id in _TEMPLATES]
+    payloads = _get_payloads()
+    result = []
+    for entry_id in _TEMPLATES:
+        entry_payloads = payloads.get(entry_id, [])
+        for i in range(len(entry_payloads)):
+            result.append(f"{entry_id}:{i}")
+    return result
 
 
 def list_flow_groups() -> List[Dict]:
