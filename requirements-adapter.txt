@@ -46,6 +46,7 @@ networkx>=3.2
 cn2an>=0.5
 word2number>=1.1
 roman>=4.0
+roman-numbers>=1.0
 xxhash>=3.4
 
 # ── Web framework (ragflow settings init imports flask/quart) ─────────────
