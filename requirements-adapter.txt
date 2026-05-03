@@ -1,0 +1,52 @@
+# Minimal dependencies for the babelfish adapter to run ragflow Canvas
+# in-process from lexus-test. This avoids installing ragflow's full 200+
+# deps (which include packages like ormsgpack that need Rust nightly).
+#
+# Only packages transitively imported by:
+#   babelfish_ragflow_adapter → agent.canvas → component classes → LLM factory
+#
+# If a new Canvas component type is added that needs extra deps, add them here.
+
+# ── Core ragflow runtime ──────────────────────────────────────────────────
+peewee>=3.17
+pymysql>=1.1
+valkey>=6.0
+elasticsearch>=8.0,<9.0
+minio>=7.2
+pydantic>=2.0
+strenum>=0.4
+json-repair>=0.30
+
+# ── LLM providers used by Canvas ──────────────────────────────────────────
+openai>=1.30
+litellm>=1.80
+httpx>=0.27
+tiktoken>=0.7
+
+# ── Data processing (Canvas components) ───────────────────────────────────
+numpy>=1.26
+pandas>=2.1
+xgboost>=2.0
+
+# ── Langfuse tracing (babelfish client trace) ────────────────────────────
+langfuse>=4.0
+
+# ── Ragflow internal utils ────────────────────────────────────────────────
+ruamel.yaml>=0.18
+chardet>=5.0
+python-dateutil>=2.9
+filelock>=3.13
+requests>=2.31
+tenacity>=8.2
+pdfplumber>=0.11
+openpyxl>=3.1
+docx2txt>=0.8
+networkx>=3.2
+cn2an>=0.5
+word2number>=1.1
+roman>=4.0
+xxhash>=3.4
+
+# ── Web framework (ragflow settings init imports flask/quart) ─────────────
+flask>=3.0
+werkzeug>=3.0
