@@ -399,35 +399,23 @@ def list_payloads() -> List[str]:
 def list_flow_groups() -> List[Dict]:
     """Return flow/subflow metadata for trace mapping.
 
-    Each template becomes one flow group. The first Agent component's
-    sys_prompt is the flow's system_message. Ragflow Canvas components
-    don't mint their own session_ids, so there are no subflows from the
-    babelfish identity perspective.
+    Reads sys_prompt directly from template DSL JSON — no Canvas
+    instantiation, no DB connections, no settings init needed.
     """
-    _ensure_ragflow_settings()
-
-    from agent.canvas import Canvas
-
     groups = []
-    for entry_id, template_rel in _TEMPLATES.items():
-        dsl = _load_and_patch_dsl(entry_id)
-        tenant_id = os.environ.get("RAGFLOW_TENANT_ID", "adapter-tenant")
+    for entry_id in _TEMPLATES:
+        dsl_str = _load_and_patch_dsl(entry_id)
+        dsl = json.loads(dsl_str)
+        components = dsl.get("components", {})
 
-        try:
-            canvas = Canvas(dsl=dsl, tenant_id=tenant_id)
-        except Exception as e:
-            raise RuntimeError(
-                f"Template '{entry_id}' failed to load: {type(e).__name__}: {e}"
-            ) from e
-
-        # Find the first Agent/LLM component's system prompt
+        # Find the first Agent/LLM component's sys_prompt
         flow_system_message = ""
-        for cpn_id, cpn_dict in canvas.components.items():
-            cpn_obj = cpn_dict["obj"]
-            if hasattr(cpn_obj, "_param") and hasattr(cpn_obj._param, "sys_prompt"):
-                if cpn_obj._param.sys_prompt:
-                    flow_system_message = cpn_obj._param.sys_prompt
-                    break
+        for cpn_id, cpn in components.items():
+            params = cpn.get("obj", {}).get("params", {})
+            sys_prompt = params.get("sys_prompt", "")
+            if sys_prompt:
+                flow_system_message = sys_prompt
+                break
 
         if not flow_system_message:
             flow_system_message = f"ragflow:{entry_id}"
