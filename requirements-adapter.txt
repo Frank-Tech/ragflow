@@ -13,7 +13,8 @@ pymysql>=1.1
 valkey>=6.0
 elasticsearch>=8.0,<9.0
 elasticsearch-dsl>=8.0,<9.0
-infinity-sdk==0.7.0-dev5
+# infinity-sdk removed — needs datrie which requires gcc to build.
+# The Infinity doc store backend isn't used by our Canvas templates.
 opensearch-py>=3.0
 pyobvector>=0.2
 sqlalchemy>=2.0
