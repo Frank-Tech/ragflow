@@ -145,15 +145,20 @@ async def run(
         ):
             yield step
 
-        actual_trace_id = (
-            main_handler.last_trace_id if main_handler and main_handler.last_trace_id
-            else parent_client_trace_id
-        )
+        # Canvas events don't contain LangGraph-style tool calls.
+        # Tool calls are captured from Langfuse traces by the pipeline.
+        yield {
+            "__tool_calls__": {
+                "tool_call_groups": [],
+                "tool_outputs": {},
+                "errored_call_ids": [],
+            }
+        }
 
         yield {
             "__trace_metadata__": {
                 "session_id": parent_session_id,
-                "client_trace_id": actual_trace_id,
+                "client_trace_id": parent_client_trace_id,
                 "server_trace_id": parent_session_id.replace("-", ""),
                 "subflow_invocations": subflow_invocations,
             }

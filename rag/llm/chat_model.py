@@ -110,6 +110,30 @@ def _apply_model_family_policies(
     return sanitized_gen_conf, sanitized_kwargs
 
 
+def _inject_langfuse_trace_id(client, trace_id_var):
+    """Wrap a langfuse.openai client to auto-inject trace_id from ContextVar.
+
+    The langfuse.openai wrapper accepts ``trace_id`` as a kwarg on
+    ``.chat.completions.create()``.  Without it, each LLM call creates its
+    own Langfuse trace.  With it, all calls share one trace — which is what
+    lexus-test needs to poll a single client trace per flow execution.
+    """
+    orig_create = client.chat.completions.create
+    if asyncio.iscoroutinefunction(orig_create):
+        async def _traced(*args, **kwargs):
+            tid = trace_id_var.get()
+            if tid and "trace_id" not in kwargs:
+                kwargs["trace_id"] = tid
+            return await orig_create(*args, **kwargs)
+    else:
+        def _traced(*args, **kwargs):
+            tid = trace_id_var.get()
+            if tid and "trace_id" not in kwargs:
+                kwargs["trace_id"] = tid
+            return orig_create(*args, **kwargs)
+    client.chat.completions.create = _traced
+
+
 class Base(ABC):
     def __init__(self, key, model_name, base_url, **kwargs):
         timeout = int(os.environ.get("LLM_TIMEOUT_SECONDS", 600))
@@ -133,6 +157,7 @@ class Base(ABC):
                 babelfish_context as _bf_ctx,
                 _current_session_id as _current_sid,
                 _current_flow_id as _current_fid,
+                _current_client_trace_id as _current_tid,
             )
             ctx = _bf_ctx.get()
             if ctx and ctx.get("mode") == "babelfish":
@@ -145,6 +170,7 @@ class Base(ABC):
                 }
         except ImportError:
             # babelfish_ragflow_adapter isn't installed → ragflow runs normally.
+            _current_tid = None
             pass
         # ────────────────────────────────────────────────────────────────────
         if bf_default_headers is not None:
@@ -153,9 +179,11 @@ class Base(ABC):
             # the client Langfuse trace. Falls back to plain OpenAI if
             # langfuse.openai isn't available.
             _OAI, _AOAI = OpenAI, AsyncOpenAI
+            _has_langfuse = False
             try:
                 from langfuse.openai import OpenAI as _LfOAI, AsyncOpenAI as _LfAOAI
                 _OAI, _AOAI = _LfOAI, _LfAOAI
+                _has_langfuse = True
             except ImportError:
                 pass
             self.client = _OAI(
@@ -166,6 +194,9 @@ class Base(ABC):
                 api_key=key, base_url=bf_base_url, timeout=timeout,
                 default_headers=bf_default_headers,
             )
+            if _has_langfuse and _current_tid is not None:
+                _inject_langfuse_trace_id(self.client, _current_tid)
+                _inject_langfuse_trace_id(self.async_client, _current_tid)
         else:
             self.client = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
             self.async_client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout)
@@ -1884,6 +1915,7 @@ class LiteLLMBase(ABC):
                 babelfish_context as _bf_ctx,
                 _current_session_id as _current_sid,
                 _current_flow_id as _current_fid,
+                _current_client_trace_id as _current_tid,
             )
             ctx = _bf_ctx.get()
             if ctx and ctx.get("mode") == "babelfish":
@@ -1901,17 +1933,17 @@ class LiteLLMBase(ABC):
                 }
                 # Use langfuse-wrapped client for auto-tracing.
                 # Each LLM call is captured as a GENERATION observation.
-                # Note: trace_id association with lexus-test's client_trace_id
-                # cannot be passed through litellm (it strips unknown kwargs).
-                # Langfuse creates its own trace per call; lexus-test correlates
-                # by timestamp window after the run.
+                # trace_id is auto-injected via _inject_langfuse_trace_id
+                # so all calls within one flow land on the same Langfuse trace.
                 try:
                     from langfuse.openai import AsyncOpenAI as _LfAOAI
-                    completion_args["client"] = _LfAOAI(
+                    lf_client = _LfAOAI(
                         api_key=completion_args.get("api_key"),
                         base_url=bf_base_url,
                         default_headers=bf_headers,
                     )
+                    _inject_langfuse_trace_id(lf_client, _current_tid)
+                    completion_args["client"] = lf_client
                 except ImportError:
                     pass
         except ImportError:
