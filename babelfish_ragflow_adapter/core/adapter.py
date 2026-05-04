@@ -20,6 +20,50 @@
 #      Canvas registry, payload definitions, flow groups, input builders, and
 #      execute_flow() that drives ragflow's Canvas runtime.
 #
+# ─── ADAPTER YIELD CONTRACT ───────────────────────────────────────────────────
+#
+# The run() async generator must yield exactly two special dicts (in order)
+# after the flow execution completes. The lexus-test runner reads these and
+# ignores all other yielded steps (which are passed through as-is).
+#
+# 1. __tool_calls__ — adapter-parsed tool call data
+#    The adapter owns event parsing (LangGraph messages, Canvas events, etc.)
+#    and yields the extracted data in this standardized shape:
+#
+#    {
+#        "__tool_calls__": {
+#            "tool_call_groups": list[list[tuple[str, str]]],
+#                # Ordered list of tool-call groups. Each group is one
+#                # AIMessage's tool_calls: [(call_id, tool_name), ...].
+#                # Parallel calls within one AIMessage are one group.
+#            "tool_outputs": dict[str, Any],
+#                # Mapping of call_id → tool output content.
+#                # Only successful (non-errored) outputs are used downstream.
+#            "errored_call_ids": list[str],
+#                # call_ids whose ToolMessage had status="error".
+#                # These are stripped from the "clean" tool path.
+#        }
+#    }
+#
+#    If the adapter cannot extract tool calls from its event stream (e.g.
+#    ragflow Canvas events don't contain them), yield empty values.
+#    The pipeline will extract tool data from Langfuse traces instead.
+#
+# 2. __trace_metadata__ — identity and trace IDs for polling
+#
+#    {
+#        "__trace_metadata__": {
+#            "session_id": str,            # REQUIRED — parent flow's UUID4
+#            "client_trace_id": str,       # REQUIRED — Langfuse client trace ID
+#            "server_trace_id": str,       # REQUIRED — session_id without hyphens
+#            "subflow_invocations": list,  # [{msg_hash, client_trace_id,
+#                                          #   server_session_id}, ...]
+#        }
+#    }
+#
+#    The runner raises RuntimeError if __trace_metadata__ is missing or
+#    lacks any of the three required keys.
+#
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import os
