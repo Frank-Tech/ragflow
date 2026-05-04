@@ -331,10 +331,60 @@ def _ensure_ragflow_settings():
     ragflow_repo = _get_ragflow_repo()
     if str(ragflow_repo) not in sys.path:
         sys.path.insert(0, str(ragflow_repo))
-    os.environ.setdefault("RAGFLOW_CONF_DIR", str(ragflow_repo / "conf"))
+    # Generate service_conf.yaml from RAGFLOW_* env vars so ragflow's
+    # settings.init_settings() connects to the correct services (Docker
+    # service names from .env.lexus, not localhost defaults).
+    conf_dir = ragflow_repo / "conf"
+    conf_dir.mkdir(exist_ok=True)
+    _write_service_conf(conf_dir / "service_conf.yaml")
+    os.environ.setdefault("RAGFLOW_CONF_DIR", str(conf_dir))
     from common import settings
     settings.init_settings()
     _settings_initialized = True
+
+
+def _write_service_conf(path: pathlib.Path) -> None:
+    """Write a service_conf.yaml from RAGFLOW_* env vars."""
+    mysql_host = os.environ.get("RAGFLOW_MYSQL_HOST", "localhost")
+    mysql_port = os.environ.get("RAGFLOW_MYSQL_PORT", "3306")
+    mysql_password = os.environ.get("RAGFLOW_MYSQL_PASSWORD", "infini_rag_flow")
+    es_host = os.environ.get("RAGFLOW_ES_HOST", "localhost")
+    es_port = os.environ.get("RAGFLOW_ES_PORT", "9200")
+    es_password = os.environ.get("RAGFLOW_ELASTIC_PASSWORD", "infini_rag_flow")
+    minio_host = os.environ.get("RAGFLOW_MINIO_HOST", "localhost")
+    minio_port = os.environ.get("RAGFLOW_MINIO_PORT", "9000")
+    minio_user = os.environ.get("RAGFLOW_MINIO_USER", "rag_flow")
+    minio_password = os.environ.get("RAGFLOW_MINIO_PASSWORD", "infini_rag_flow")
+    redis_host = os.environ.get("RAGFLOW_REDIS_HOST", "localhost")
+    redis_port = os.environ.get("RAGFLOW_REDIS_PORT", "6379")
+    redis_password = os.environ.get("RAGFLOW_REDIS_PASSWORD", "infini_rag_flow")
+
+    conf = f"""ragflow:
+  host: 0.0.0.0
+  http_port: 9380
+mysql:
+  name: 'rag_flow'
+  user: 'root'
+  password: '{mysql_password}'
+  host: '{mysql_host}'
+  port: {mysql_port}
+  max_connections: 100
+  stale_timeout: 300
+minio:
+  user: '{minio_user}'
+  password: '{minio_password}'
+  host: '{minio_host}:{minio_port}'
+es:
+  hosts: 'http://{es_host}:{es_port}'
+  username: 'elastic'
+  password: '{es_password}'
+redis:
+  db: 1
+  username: ''
+  password: '{redis_password}'
+  host: '{redis_host}:{redis_port}'
+"""
+    path.write_text(conf)
 
 
 # ── Contract functions ────────────────────────────────────────────────────────
