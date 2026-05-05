@@ -90,14 +90,21 @@ def message_fit_in(msg, max_length=4000):
 
     ll = num_tokens_from_string(msg_[0]["content"])
     ll2 = num_tokens_from_string(msg_[-1]["content"])
-    if ll / (ll + ll2) > 0.8:
-        m = msg_[0]["content"]
-        m = encoder.decode(encoder.encode(m)[: max_length - ll2])
-        msg[0]["content"] = m
-        return max_length, msg
+    if ll >= max_length:
+        # System message is the agent's identity contract — downstream
+        # systems (e.g. babelfish/holy-grail) hash it to derive a stable
+        # agentic_flow uuid. Slicing it would silently mutate that
+        # identity per call, fragmenting one logical agent into many
+        # rows. Refuse instead so the operator shortens the prompt or
+        # configures a model with more context.
+        raise RuntimeError(
+            f"System message ({ll} tokens) exceeds the available "
+            f"context budget ({max_length} tokens). Shorten the system "
+            f"prompt or configure the model with a larger max_tokens."
+        )
 
     m = msg_[-1]["content"]
-    m = encoder.decode(encoder.encode(m)[: max_length - ll2])
+    m = encoder.decode(encoder.encode(m)[: max_length - ll])
     msg[-1]["content"] = m
     return max_length, msg
 
