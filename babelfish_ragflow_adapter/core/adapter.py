@@ -299,6 +299,19 @@ def _get_ragflow_repo() -> pathlib.Path:
     ).resolve()
 
 
+_AGENT_USER_PROMPT_PLACEHOLDER = "This is the order you need to send to the agent."
+"""Default description text for the Agent-as-tool ``user_prompt`` parameter
+(see ragflow's ``agent/component/agent_with_tools.py:AgentParam.meta``).
+Several upstream templates (deep_research, seo_article_writer) copy this
+string verbatim into ``params.user_prompt`` on their sub-Agent tool entries.
+At runtime ragflow's ``get_meta`` then writes that value into the OpenAI
+tool-schema ``default`` field, and the LLM falls back to it instead of
+composing a real instruction — so the orchestrator sends sub-Agents a
+literal "This is the order..." string and they reply "please provide the
+URLs" until max_rounds. We strip this placeholder at load time so the
+``default`` is left empty and the LLM is forced to generate real args."""
+
+
 def _load_and_patch_dsl(entry_id: str) -> str:
     """Load a template DSL, apply runtime patches, return JSON string.
 
@@ -307,6 +320,7 @@ def _load_and_patch_dsl(entry_id: str) -> str:
     - Tavily API key injection from RAGFLOW_TAVILY_API_KEY
     - KB ID injection from RAGFLOW_KB_FAQ / RAGFLOW_KB_RESEARCH
     - Strip paid search tools from web_search_assistant
+    - Strip placeholder user_prompt on Agent-as-tool entries
     """
     ragflow_repo = _get_ragflow_repo()
     template_path = ragflow_repo / _TEMPLATES[entry_id]
@@ -351,6 +365,11 @@ def _load_and_patch_dsl(entry_id: str) -> str:
             # Override llm_id in nested Agent tools
             if tn == "Agent" and llm_override and "llm_id" in tp:
                 tp["llm_id"] = llm_override
+
+            # Strip placeholder user_prompt on Agent-as-tool entries
+            # (see _AGENT_USER_PROMPT_PLACEHOLDER docstring above for why)
+            if tn == "Agent" and tp.get("user_prompt") == _AGENT_USER_PROMPT_PLACEHOLDER:
+                tp["user_prompt"] = ""
 
             # Inject Tavily key in nested Agent tools' inner tools
             for inner_tool in tp.get("tools", []):
