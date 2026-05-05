@@ -102,6 +102,11 @@ class ToolParamBase(ComponentParamBase):
             }
             if "enum" in p:
                 params[k]["enum"] = p["enum"]
+            # TODO: remove when upstream get_meta preserves `items` for array
+            # properties (without it, OpenAI strict tool-schema validation
+            # rejects array-typed parameters like Tavily's include_domains).
+            if "items" in p:
+                params[k]["items"] = p["items"]
 
         desc = getattr(self, "description", None) or self.meta["description"]
         function_name = getattr(self, "function_name", self.meta["name"])

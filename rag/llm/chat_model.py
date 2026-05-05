@@ -414,7 +414,10 @@ class Base(ABC):
             "role": "assistant",
             "tool_calls": [
                 {
-                    "index": tc.index,
+                    # TODO: remove guard when upstream handles non-streaming
+                    # tool_calls (ChatCompletionMessageToolCall has no .index;
+                    # only the streaming ChoiceDeltaToolCall variant does).
+                    "index": getattr(tc, "index", 0),
                     "id": tc.id,
                     "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                     "type": "function",
@@ -1575,7 +1578,10 @@ class LiteLLMBase(ABC):
             "role": "assistant",
             "tool_calls": [
                 {
-                    "index": tc.index,
+                    # TODO: remove guard when upstream handles non-streaming
+                    # tool_calls (ChatCompletionMessageToolCall has no .index;
+                    # only the streaming ChoiceDeltaToolCall variant does).
+                    "index": getattr(tc, "index", 0),
                     "id": tc.id,
                     "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                     "type": "function",

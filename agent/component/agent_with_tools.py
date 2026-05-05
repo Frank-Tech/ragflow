@@ -189,66 +189,89 @@ class Agent(LLM, ToolBase):
         if self.check_if_canceled("Agent processing"):
             return
 
+        # Mint fresh X-Session-ID for sub-Agent invocations called as tools.
+        # Babelfish rejects shared session_id across distinct system messages
+        # ("Session ... was already used with a different system message"),
+        # so each Agent role must send its own session_id. Sub-Agents are
+        # invoked as tools (kwargs["user_prompt"] is set); the top-level
+        # FLOW Agent is not, so it keeps the adapter's parent session_id.
+        _bf_session_token = None
+        _bf_current_session_id = None
         if kwargs.get("user_prompt"):
-            usr_pmt = ""
-            if kwargs.get("reasoning"):
-                usr_pmt += "\nREASONING:\n{}\n".format(kwargs["reasoning"])
-            if kwargs.get("context"):
-                usr_pmt += "\nCONTEXT:\n{}\n".format(kwargs["context"])
-            if usr_pmt:
-                usr_pmt += "\nQUERY:\n{}\n".format(str(kwargs["user_prompt"]))
-            else:
-                usr_pmt = str(kwargs["user_prompt"])
-            self._param.prompts = [{"role": "user", "content": usr_pmt}]
+            try:
+                from babelfish_ragflow_adapter.core.context import (
+                    mint_flow_session as _mint_flow_session,
+                    _current_session_id as _bf_current_session_id,
+                )
+                _new_sid, _, _ = _mint_flow_session(self._param.sys_prompt)
+                _bf_session_token = _bf_current_session_id.set(_new_sid)
+            except ImportError:
+                _bf_current_session_id = None
 
-        if not self.tools:
-            if self.check_if_canceled("Agent processing"):
+        try:
+            if kwargs.get("user_prompt"):
+                usr_pmt = ""
+                if kwargs.get("reasoning"):
+                    usr_pmt += "\nREASONING:\n{}\n".format(kwargs["reasoning"])
+                if kwargs.get("context"):
+                    usr_pmt += "\nCONTEXT:\n{}\n".format(kwargs["context"])
+                if usr_pmt:
+                    usr_pmt += "\nQUERY:\n{}\n".format(str(kwargs["user_prompt"]))
+                else:
+                    usr_pmt = str(kwargs["user_prompt"])
+                self._param.prompts = [{"role": "user", "content": usr_pmt}]
+
+            if not self.tools:
+                if self.check_if_canceled("Agent processing"):
+                    return
+                return await LLM._invoke_async(self, **kwargs)
+
+            prompt, msg, user_defined_prompt = self._prepare_prompt_variables()
+            output_schema = self._get_output_schema()
+            schema_prompt = ""
+            if output_schema:
+                schema = json.dumps(output_schema, ensure_ascii=False, indent=2)
+                schema_prompt = structured_output_prompt(schema)
+
+            component = self._canvas.get_component(self._id)
+            downstreams = component["downstream"] if component else []
+            ex = self.exception_handler()
+            msg = self._fit_messages(prompt, msg)
+            self._append_system_prompt(msg, schema_prompt)
+            ans = await self._generate_async(msg)
+
+            if ans.find("**ERROR**") >= 0:
+                logging.error(f"Agent._chat got error. response: {ans}")
+                if self.get_exception_default_value():
+                    self.set_output("content", self.get_exception_default_value())
+                else:
+                    self.set_output("_ERROR", ans)
                 return
-            return await LLM._invoke_async(self, **kwargs)
 
-        prompt, msg, user_defined_prompt = self._prepare_prompt_variables()
-        output_schema = self._get_output_schema()
-        schema_prompt = ""
-        if output_schema:
-            schema = json.dumps(output_schema, ensure_ascii=False, indent=2)
-            schema_prompt = structured_output_prompt(schema)
+            if output_schema:
+                error = ""
+                for _ in range(self._param.max_retries + 1):
+                    try:
+                        obj = json_repair.loads(self._clean_formatted_answer(ans))
+                        self.set_output("structured", obj)
+                        return obj
+                    except Exception:
+                        error = "The answer cannot be parsed as JSON"
+                        ans = await self._force_format_to_schema_async(ans, schema_prompt)
+                        if ans.find("**ERROR**") >= 0:
+                            continue
 
-        component = self._canvas.get_component(self._id)
-        downstreams = component["downstream"] if component else []
-        ex = self.exception_handler()
-        msg = self._fit_messages(prompt, msg)
-        self._append_system_prompt(msg, schema_prompt)
-        ans = await self._generate_async(msg)
+                self.set_output("_ERROR", error)
+                return
 
-        if ans.find("**ERROR**") >= 0:
-            logging.error(f"Agent._chat got error. response: {ans}")
-            if self.get_exception_default_value():
-                self.set_output("content", self.get_exception_default_value())
-            else:
-                self.set_output("_ERROR", ans)
-            return
-
-        if output_schema:
-            error = ""
-            for _ in range(self._param.max_retries + 1):
-                try:
-                    obj = json_repair.loads(self._clean_formatted_answer(ans))
-                    self.set_output("structured", obj)
-                    return obj
-                except Exception:
-                    error = "The answer cannot be parsed as JSON"
-                    ans = await self._force_format_to_schema_async(ans, schema_prompt)
-                    if ans.find("**ERROR**") >= 0:
-                        continue
-
-            self.set_output("_ERROR", error)
-            return
-
-        artifact_md = self._collect_tool_artifact_markdown(existing_text=ans)
-        if artifact_md:
-            ans += "\n\n" + artifact_md
-        self.set_output("content", ans)
-        return ans
+            artifact_md = self._collect_tool_artifact_markdown(existing_text=ans)
+            if artifact_md:
+                ans += "\n\n" + artifact_md
+            self.set_output("content", ans)
+            return ans
+        finally:
+            if _bf_session_token is not None and _bf_current_session_id is not None:
+                _bf_current_session_id.reset(_bf_session_token)
 
     async def stream_output_with_tools_async(self, prompt, msg, user_defined_prompt={}):
         if len(msg) > 3:
