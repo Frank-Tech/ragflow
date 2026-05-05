@@ -553,8 +553,6 @@ class ComponentBase(ABC):
 
     @staticmethod
     def string_format(content: str, kv: dict[str, str]) -> str:
-        # DEBUG: remove after diagnosing trip_planner empty-content
-        _orig = content
         for n, v in kv.items():
             def repl(_match, val=v):
                 return str(val) if val is not None else ""
@@ -564,9 +562,6 @@ class ComponentBase(ABC):
                 repl,
                 content
             )
-        # DEBUG: remove after diagnosing trip_planner empty-content
-        if not content and _orig:
-            logging.info(f"[DEBUG string_format] produced empty from non-empty input; orig={_orig!r} kv={kv!r}")
         return content
 
     def exception_handler(self):

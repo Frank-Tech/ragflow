@@ -396,7 +396,42 @@ def _ensure_ragflow_settings():
     os.environ.setdefault("RAGFLOW_CONF_DIR", str(conf_dir))
     from common import settings
     settings.init_settings()
+    _seed_llm_for_tools()
     _settings_initialized = True
+
+
+def _seed_llm_for_tools():
+    """Upsert the RAGFLOW_LLM_ID row in ragflow's `llm` table with
+    is_tools=True, so LLMBundle.bind_tools actually binds the tools.
+
+    Why: ragflow's `llm` table is seeded from conf/llm_factories.json
+    which carries stable names like 'gpt-4o', not date-pinned snapshots
+    like 'gpt-4o-2024-08-06'. Lexus-test pins the snapshot for baseline
+    parity, so the snapshot name misses the JSON seed → LLMService.query
+    returns no row → is_tools defaults to False → LLMBundle.bind_tools
+    drops the tools binding silently → orchestrator has no tool-call
+    surface for babelfish to learn from. Upserting here at adapter init
+    closes that gap without modifying upstream ragflow code.
+    """
+    llm_id = os.environ.get("RAGFLOW_LLM_ID")
+    if not llm_id or "@" not in llm_id:
+        return
+    llm_name, _, fid = llm_id.partition("@")
+    from api.db.services.llm_service import LLMService
+    existing = LLMService.query(llm_name=llm_name, fid=fid)
+    if existing:
+        row = existing[0]
+        if not row.is_tools:
+            LLMService.update_by_id(row.id, {"is_tools": True})
+        return
+    LLMService.save(
+        llm_name=llm_name,
+        fid=fid,
+        model_type="chat",
+        tags="LLM,CHAT,128K",
+        max_tokens=128000,
+        is_tools=True,
+    )
 
 
 def _write_service_conf(path: pathlib.Path) -> None:
