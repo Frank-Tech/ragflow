@@ -124,7 +124,10 @@ class LLM(ComponentBase):
             p = deepcopy(p)
             p["content"] = self.string_format(p["content"], args)
             msg.append(p)
-        return msg, self.string_format(self._param.sys_prompt, args)
+        sys_out = self.string_format(self._param.sys_prompt, args)
+        # DEBUG: remove after diagnosing trip_planner empty-content
+        logging.info(f"[DEBUG {self._id}] msg_out={msg!r} sys_prompt_len={len(sys_out)}")
+        return msg, sys_out
 
     @staticmethod
     def _extract_data_images(value) -> list[str]:
@@ -245,6 +248,11 @@ class LLM(ComponentBase):
                 except Exception:
                     args[k] = str(args[k])
             self.set_input_value(k, args[k])
+
+        # DEBUG: remove after diagnosing trip_planner empty-content
+        logging.info(f"[DEBUG {self._id}] args={args!r}")
+        # DEBUG: remove after diagnosing trip_planner empty-content
+        logging.info(f"[DEBUG {self._id}] history_in={self._canvas.get_history(self._param.message_history_window_size)!r}")
 
         self.imgs = self._uniq_images(self.imgs + extracted_imgs)
         if self.imgs and TenantLLMService.llm_id2llm_type(self._param.llm_id) == LLMType.CHAT.value:
@@ -407,14 +415,6 @@ class LLM(ComponentBase):
                     error = "The answer can't not be parsed as JSON"
             if error:
                 self.set_output("_ERROR", error)
-            return
-
-        downstreams = self._canvas.get_component(self._id)["downstream"] if self._canvas.get_component(self._id) else []
-        ex = self.exception_handler()
-        if any([self._canvas.get_component_obj(cid).component_name.lower() == "message" for cid in downstreams]) and not (
-            ex and ex["goto"]
-        ):
-            self.set_output("content", partial(self._stream_output_async, prompt, deepcopy(msg)))
             return
 
         error = ""

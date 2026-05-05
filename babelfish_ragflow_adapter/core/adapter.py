@@ -220,6 +220,18 @@ async def run(
                     cb._langfuse_client.flush()
                 except Exception:
                     pass
+        # Flush the langfuse.openai singleton client (used by the drop-in
+        # AsyncOpenAI wrapper in chat_model.py). Without this, observations
+        # buffered on the background queue may not reach Langfuse before
+        # lexus-test starts polling, producing "trace not found" / "0
+        # observations" failures. Use get_client() to grab the singleton
+        # rather than constructing a new Langfuse() (which would have an
+        # empty queue).
+        try:
+            from langfuse import get_client
+            get_client().flush()
+        except Exception:
+            pass
         try:
             _current_client_trace_id.reset(trace_id_token)
         except ValueError:
@@ -252,17 +264,12 @@ import pathlib
 # ── Template registry ─────────────────────────────────────────────────────────
 
 _TEMPLATES: Dict[str, str] = {
-    "trip_planner": "agent/templates/trip_planner.json",
-    "market_seo_article_writer": "agent/templates/market_seo_article_writer.json",
-    # stock_market_research_assistant excluded — requires YahooFinance component
-    # which has missing dependencies in the current ragflow checkout.
+    # Only templates with at least one Agent that passes the Agent Inclusion
+    # Contract (see tai-nexus-lexus-test/src/.../core/external_adapter.py).
+    # Each of these contributes 1 FLOW (a multi-tool Agent with chained
+    # sub-Agents-as-tools, triggered from the graph entry).
     "deep_research": "agent/templates/deep_research.json",
     "seo_article_writer": "agent/templates/seo_article_writer.json",
-    "web_search_assistant": "agent/templates/web_search_assistant.json",
-    "reflective_academic_paper_generator": "agent/templates/reflective_academic_paper_generator.json",
-    "user_interaction": "agent/templates/user_interaction.json",
-    "your_starter_dataset_chatbot": "agent/templates/your_starter_dataset_chatbot.json",
-    "data_analysis_beginner_assistant": "agent/templates/data_analysis_beginner_assistant.json",
 }
 
 def _load_payloads() -> Dict[str, list[str]]:

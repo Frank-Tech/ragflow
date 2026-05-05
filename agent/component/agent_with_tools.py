@@ -216,11 +216,6 @@ class Agent(LLM, ToolBase):
         component = self._canvas.get_component(self._id)
         downstreams = component["downstream"] if component else []
         ex = self.exception_handler()
-        has_message_downstream = any(self._canvas.get_component_obj(cid).component_name.lower() == "message" for cid in downstreams)
-        if has_message_downstream and not (ex and ex["goto"]) and not output_schema:
-            self.set_output("content", partial(self.stream_output_with_tools_async, prompt, deepcopy(msg), user_defined_prompt))
-            return
-
         msg = self._fit_messages(prompt, msg)
         self._append_system_prompt(msg, schema_prompt)
         ans = await self._generate_async(msg)
