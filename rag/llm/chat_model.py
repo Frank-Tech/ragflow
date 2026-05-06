@@ -1941,11 +1941,20 @@ class LiteLLMBase(ABC):
             completion_args["extra_headers"] = extra_headers
 
         # ── babelfish routing + Langfuse tracing ────────────────────────
-        # LiteLLMBase is used for OpenAI and many other providers. When the
-        # babelfish adapter is active and mode == "babelfish", we must:
-        # 1. Route through the nexus proxy (override api_base + add headers)
-        # 2. Use a langfuse-wrapped AsyncOpenAI client for auto-tracing
-        #    (litellm's "langfuse" callback is broken with langfuse 4.x)
+        # LiteLLMBase is used for OpenAI and many other providers.
+        #
+        # Routing (mode-gated): when mode == "babelfish", route through the
+        # nexus proxy (override api_base + add babelfish headers).
+        #
+        # Tracing (mode-independent): whenever the babelfish adapter is
+        # active (ctx set), wrap with langfuse.openai's AsyncOpenAI and
+        # inject the adapter-reported client_trace_id so every LLM call
+        # in the flow lands on a single Langfuse trace findable by
+        # lexus-test. Without this, baseline runs use plain OpenAI and
+        # langfuse-sdk v4's OTel auto-instrumentation gives each call
+        # its own auto-generated trace_id — unfindable from the adapter
+        # side. (litellm's "langfuse" callback is broken with langfuse
+        # 4.x, so we wrap the client directly.)
         try:
             from babelfish_ragflow_adapter.core.context import (
                 babelfish_context as _bf_ctx,
@@ -1954,7 +1963,9 @@ class LiteLLMBase(ABC):
                 _current_client_trace_id as _current_tid,
             )
             ctx = _bf_ctx.get()
-            if ctx and ctx.get("mode") == "babelfish":
+            is_babelfish = bool(ctx and ctx.get("mode") == "babelfish")
+            bf_headers: dict | None = None
+            if is_babelfish:
                 bf_base_url = os.environ["OPENAI_BASE_URL"]
                 bf_headers = {
                     "X-Session-ID": _current_sid.get() or "",
@@ -1967,17 +1978,20 @@ class LiteLLMBase(ABC):
                     **(completion_args.get("extra_headers") or {}),
                     **bf_headers,
                 }
-                # Use langfuse-wrapped client for auto-tracing.
-                # Each LLM call is captured as a GENERATION observation.
-                # trace_id is auto-injected via _inject_langfuse_trace_id
-                # so all calls within one flow land on the same Langfuse trace.
+
+            # Tracing fires whenever the adapter is active (ctx set), in
+            # both baseline and babelfish modes — so all LLM calls in a
+            # flow share parent_client_trace_id.
+            if ctx is not None:
                 try:
                     from langfuse.openai import AsyncOpenAI as _LfAOAI
-                    lf_client = _LfAOAI(
-                        api_key=completion_args.get("api_key"),
-                        base_url=bf_base_url,
-                        default_headers=bf_headers,
-                    )
+                    lf_kwargs: dict = {
+                        "api_key": completion_args.get("api_key"),
+                        "base_url": completion_args.get("api_base") or self.base_url,
+                    }
+                    if bf_headers:
+                        lf_kwargs["default_headers"] = bf_headers
+                    lf_client = _LfAOAI(**lf_kwargs)
                     _inject_langfuse_trace_id(lf_client, _current_tid)
                     completion_args["client"] = lf_client
                 except ImportError:
