@@ -1875,8 +1875,12 @@ class LiteLLMBase(ABC):
         # ── babelfish routing + Langfuse tracing ────────────────────────
         # LiteLLMBase is used for OpenAI and many other providers.
         #
-        # Routing (mode-gated): when mode == "babelfish", route through the
-        # nexus proxy (override api_base + add babelfish headers).
+        # Routing (gated on mode AND system-message hash): only system
+        # messages declared by adapter.list_flow_groups() (parent flow +
+        # registered subflows) get the babelfish headers. Sub-Agent calls
+        # and other LLM machinery go direct to the provider. Mirrors the
+        # per-call gate in babelfish_ragflow_adapter.core.context.
+        # _RoutingCompletions.create for the chat_model.Base path.
         #
         # Tracing (mode-independent): whenever the babelfish adapter is
         # active (ctx set), wrap with langfuse.openai's AsyncOpenAI and
@@ -1893,15 +1897,36 @@ class LiteLLMBase(ABC):
                 _current_session_id as _current_sid,
                 _current_flow_id as _current_fid,
                 _current_client_trace_id as _current_tid,
+                _is_tracked_system_content,
+                _inject_langfuse_trace_id,
             )
             ctx = _bf_ctx.get()
             is_babelfish = bool(ctx and ctx.get("mode") == "babelfish")
+
+            # Extract this call's system-message content for the registry
+            # check. Use the first ``role == "system"`` entry — same primitive
+            # as the chat_model.Base routing wrapper.
+            _sm = next(
+                (m.get("content") for m in (history or [])
+                 if isinstance(m, dict) and m.get("role") == "system"),
+                None,
+            )
+
             bf_headers: dict | None = None
-            if is_babelfish:
+            if is_babelfish and _sm and _is_tracked_system_content(_sm):
+                _sid = _current_sid.get()
+                _fid = _current_fid.get() or ctx["flow_id"]
+                if not _sid or not _fid:
+                    raise RuntimeError(
+                        "babelfish-tracked LLM call missing X-Session-ID or "
+                        "X-Flow-ID — _current_session_id/_current_flow_id "
+                        "contextvar is None at call time. The adapter must "
+                        "set both before any tracked LLM call."
+                    )
                 bf_base_url = os.environ["OPENAI_BASE_URL"]
                 bf_headers = {
-                    "X-Session-ID": _current_sid.get() or "",
-                    "X-Flow-ID": _current_fid.get() or ctx["flow_id"],
+                    "X-Session-ID": _sid,
+                    "X-Flow-ID": _fid,
                     "X-Api-Key": os.environ["NEXUS_API_KEY"],
                     "X-Auto-Approve": "true",
                 }
