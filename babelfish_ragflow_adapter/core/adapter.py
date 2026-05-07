@@ -150,12 +150,22 @@ async def run(
     callbacks, main_handler = _build_langfuse_callbacks(parent_client_trace_id)
 
     subflow_invocations: list = []
+    # Seed the tracked-message registry with every subflow's pre-computed
+    # msg_hash. Lexus-test hashes the same canonical {"role":"system","content":sm}
+    # dict, so these hashes match what the routing wrapper computes at call time.
+    # The parent flow's SM hash is added by execute_flow() once the DSL is loaded.
+    tracked_message_hashes: set = {
+        v["msg_hash"]
+        for v in (subflow_server_ids or {}).values()
+        if isinstance(v, dict) and "msg_hash" in v
+    }
     token = babelfish_context.set(
         {
             "mode": mode,
             "flow_id": flow_id,
             "subflow_server_ids": subflow_server_ids or {},
             "subflow_invocations": subflow_invocations,
+            "tracked_message_hashes": tracked_message_hashes,
             "model_override": model,
         }
     )
@@ -534,6 +544,27 @@ async def execute_flow(
 
     dsl = _load_and_patch_dsl(entry_id)
     tenant_id = os.environ.get("RAGFLOW_TENANT_ID", "adapter-tenant")
+
+    # Populate the tracked-message registry with every entry/parent Agent's
+    # sys_prompt. Top-level Agent components with a non-empty sys_prompt are
+    # entry/parent agents per ragflow's Canvas DSL convention. Sub-agents nest
+    # under params.tools (not at top level) and are intentionally excluded —
+    # their LLM calls go direct to OpenAI rather than through babelfish.
+    from babelfish_ragflow_adapter.core.context import hash_system_message_content
+    ctx = babelfish_context.get()
+    if ctx is not None:
+        # run() always installs this set; index access (not .get with default)
+        # so a missing key surfaces loudly instead of silently mutating a
+        # throwaway set.
+        registry: set = ctx["tracked_message_hashes"]
+        dsl_obj = json.loads(dsl)
+        for cpn in dsl_obj.get("components", {}).values():
+            obj = cpn.get("obj", {})
+            if obj.get("component_name") != "Agent":
+                continue
+            sys_prompt = obj.get("params", {}).get("sys_prompt", "") or ""
+            if sys_prompt:
+                registry.add(hash_system_message_content(sys_prompt))
 
     from agent.canvas import Canvas
     canvas = Canvas(dsl=dsl, tenant_id=tenant_id)

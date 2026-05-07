@@ -17,20 +17,26 @@
 #
 # ``babelfish_context`` still exists, but it only carries cross-cutting state
 # that's invariant across all calls inside one adapter.run() invocation:
-#   - mode           ("babelfish" | "baseline")
-#   - flow_id        (X-Flow-ID header)
-#   - subflow_server_ids  (which system messages belong to tracked subflows)
-#   - subflow_invocations (accumulator for __trace_metadata__)
+#   - mode                    ("babelfish" | "baseline")
+#   - flow_id                 (X-Flow-ID header)
+#   - subflow_server_ids      (which system messages belong to tracked subflows)
+#   - subflow_invocations     (accumulator for __trace_metadata__)
+#   - tracked_message_hashes  (SHA-256 of every babelfish-managed system message;
+#                              the routing wrapper checks this set at call time)
 #
-# CRITICAL — LLM CLIENT CACHING PITFALL:
-#   The LLM factory bakes X-Session-ID and other headers into the ChatOpenAI
-#   instance at creation time. LLM clients MUST be created fresh per invocation
-#   (inside agent_node functions), NOT cached in __init__ or as class attributes.
-#   Cached clients carry stale headers from the first invocation.
+# ─── Headers are resolved at call time, not construction time ───────────────
+#
+# X-Session-ID, X-Flow-ID and X-Api-Key are read from the ContextVars below
+# inside ``_RoutingCompletions.create`` (see this module). There is no need to
+# create chat clients fresh per invocation — cached clients pick up the right
+# values automatically because the headers are built per-call from contextvars.
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 
+import asyncio
 import contextvars
+import hashlib
+import json
 import os
 import uuid as _uuid
 from typing import Optional, TypedDict
@@ -63,10 +69,13 @@ class _CallbackIsolationHandler(BaseCallbackHandler):
 # ── ContextVar Definition ─────────────────────────────────────────────────────
 
 class BabelfishContextData(TypedDict):
-    mode: str                  # "baseline" | "babelfish"
-    flow_id: str               # X-Flow-ID header for babelfish routing
-    subflow_server_ids: dict   # system_message_content → {"msg_hash": ..., "flow_uuid": ...} (identifies tracked subflows)
-    subflow_invocations: list  # accumulator: list[{msg_hash, client_trace_id, server_session_id}]
+    mode: str                       # "baseline" | "babelfish"
+    flow_id: str                    # X-Flow-ID header for babelfish routing
+    subflow_server_ids: dict        # system_message_content → {"msg_hash": ..., "flow_uuid": ...} (tracked subflows)
+    subflow_invocations: list       # accumulator: list[{msg_hash, client_trace_id, server_session_id}]
+    tracked_message_hashes: set     # SHA-256 hashes of every babelfish-managed system message (parent + subflows).
+                                    # Routing wrapper at chat-completions.create time checks this set to decide
+                                    # babelfish vs direct OpenAI. Mutated by execute_flow() after DSL load.
 
 
 babelfish_context: contextvars.ContextVar[Optional[BabelfishContextData]] = contextvars.ContextVar(
@@ -138,6 +147,167 @@ def flush_callbacks(callbacks: list) -> None:
                 cb._langfuse_client.flush()
             except Exception:
                 pass
+
+
+# ── Canonical system-message hash ─────────────────────────────────────────────
+# Anchored on babelfish's hash_system_message
+# (tai_nexus_holy_grail/babelfish/utils/nexus_util.py:29) — that's the function
+# that compares slot ownership in Redis. Lexus-test's copy is byte-identical
+# today; if either drifts, this is the one we MUST follow.
+#
+# Canonical input shape: {"role": "system", "content": <str>}. Strip everything
+# else (e.g. ``name`` on tool-result-bearing messages) before hashing so the
+# call-time hash matches the registration-time hash.
+
+def hash_system_message_content(content: str) -> str:
+    """SHA-256 of the canonical system-message dict for a given content string."""
+    canonical = {"role": "system", "content": content}
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+def _is_tracked_system_content(content: str) -> bool:
+    """True if the system-message content is in the tracked-message registry."""
+    ctx = babelfish_context.get()
+    if not ctx:
+        return False
+    return hash_system_message_content(content) in ctx.get("tracked_message_hashes", set())
+
+
+# ── Langfuse trace_id auto-injection ──────────────────────────────────────────
+# When the langfuse.openai drop-in wrapper is active, every call creates its
+# own Langfuse trace unless ``trace_id`` is passed in. This helper rebinds
+# ``client.chat.completions.create`` so it reads the current trace_id from a
+# ContextVar at call time — pinning every call inside one adapter.run() to one
+# client trace, which lexus-test polls.
+
+def _inject_langfuse_trace_id(client, trace_id_var):
+    orig_create = client.chat.completions.create
+    if asyncio.iscoroutinefunction(orig_create):
+        async def _traced(*args, **kwargs):
+            tid = trace_id_var.get()
+            if tid and "trace_id" not in kwargs:
+                kwargs["trace_id"] = tid
+            return await orig_create(*args, **kwargs)
+    else:
+        def _traced(*args, **kwargs):
+            tid = trace_id_var.get()
+            if tid and "trace_id" not in kwargs:
+                kwargs["trace_id"] = tid
+            return orig_create(*args, **kwargs)
+    client.chat.completions.create = _traced
+
+
+# ── Per-call routing client ───────────────────────────────────────────────────
+# At chat.completions.create time, decide babelfish vs direct OpenAI based on
+# whether the call's system message is in the tracked-message registry. Headers
+# for the babelfish path are read from ContextVars at CALL time (not at client
+# construction), so the cached-stale-header bug is structurally impossible.
+
+class _RoutingCompletions:
+    def __init__(self, direct_client, bf_client, nexus_api_key):
+        self._direct = direct_client
+        self._bf = bf_client
+        self._nexus_api_key = nexus_api_key
+
+    def create(self, *args, **kwargs):
+        messages = kwargs.get("messages") or (args[0] if args else [])
+        sm = next(
+            (m.get("content") for m in messages if isinstance(m, dict) and m.get("role") == "system"),
+            None,
+        )
+        if sm and _is_tracked_system_content(sm):
+            sid = _current_session_id.get()
+            fid = _current_flow_id.get()
+            if not sid or not fid:
+                raise RuntimeError(
+                    "babelfish-tracked LLM call missing X-Session-ID or X-Flow-ID — "
+                    "_current_session_id/_current_flow_id contextvar is None at call time. "
+                    "The adapter must set both before any tracked LLM call."
+                )
+            extra_headers = dict(kwargs.pop("extra_headers", None) or {})
+            extra_headers.update({
+                "X-Session-ID": sid,
+                "X-Flow-ID": fid,
+                "X-Api-Key": self._nexus_api_key,
+                "X-Auto-Approve": "true",
+            })
+            return self._bf.chat.completions.create(*args, extra_headers=extra_headers, **kwargs)
+        return self._direct.chat.completions.create(*args, **kwargs)
+
+
+class _RoutingChat:
+    def __init__(self, direct_client, bf_client, nexus_api_key):
+        self.completions = _RoutingCompletions(direct_client, bf_client, nexus_api_key)
+
+
+class _RoutingClient:
+    """Proxy that exposes ``.chat.completions.create`` and forwards everything
+    else to the direct (provider) client. Built once per ``Base.__init__``;
+    routing decision happens per call."""
+
+    def __init__(self, direct_client, bf_client, nexus_api_key):
+        self._direct = direct_client
+        self._bf = bf_client
+        self.chat = _RoutingChat(direct_client, bf_client, nexus_api_key)
+
+    def __getattr__(self, name):
+        return getattr(self._direct, name)
+
+
+def build_chat_clients(*, api_key: str, provider_base_url: str, timeout: int):
+    """Called by ragflow ``rag/llm/chat_model.py:Base.__init__``.
+
+    Returns a ``(sync_client, async_client)`` pair when the babelfish adapter
+    is active in this context; returns ``None`` when inactive (caller falls
+    back to plain ``OpenAI`` / ``AsyncOpenAI``).
+
+    Both clients in the pair are routing wrappers: per-call, they inspect the
+    request's system message and dispatch to either the babelfish proxy (with
+    contextvar-derived headers built at call time) or the provider's API
+    directly. Both underlying paths are wrapped with ``langfuse.openai`` so
+    Langfuse client tracing captures every call regardless of routing.
+
+    Known limitation — sub-Agent X-Flow-ID:
+        ``agent/component/agent_with_tools.py`` mints a fresh session_id for
+        sub-Agent invocations but discards the flow_id returned by
+        ``mint_flow_session`` (it sets ``_current_session_id`` but not
+        ``_current_flow_id``). Today ragflow declares zero subflows in
+        ``list_flow_groups``, so sub-Agent SMs are never in the registry and
+        their calls go direct to OpenAI — flow_id doesn't matter. If subflow
+        tracking is ever enabled for ragflow, the agent_with_tools mint block
+        must also override ``_current_flow_id`` with the subflow's flow_uuid,
+        otherwise this wrapper will send the parent's X-Flow-ID for subflow
+        calls.
+    """
+    ctx = babelfish_context.get()
+    if not ctx or ctx.get("mode") != "babelfish":
+        return None
+
+    bf_base_url = os.environ["OPENAI_BASE_URL"]
+    nexus_api_key = os.environ["NEXUS_API_KEY"]
+
+    try:
+        from langfuse.openai import OpenAI as _OAI, AsyncOpenAI as _AOAI
+        has_langfuse = True
+    except ImportError:
+        from openai import OpenAI as _OAI, AsyncOpenAI as _AOAI
+        has_langfuse = False
+
+    direct_sync = _OAI(api_key=api_key, base_url=provider_base_url, timeout=timeout)
+    bf_sync     = _OAI(api_key=api_key, base_url=bf_base_url,       timeout=timeout)
+    direct_async = _AOAI(api_key=api_key, base_url=provider_base_url, timeout=timeout)
+    bf_async     = _AOAI(api_key=api_key, base_url=bf_base_url,       timeout=timeout)
+
+    if has_langfuse:
+        for c in (direct_sync, bf_sync, direct_async, bf_async):
+            _inject_langfuse_trace_id(c, _current_client_trace_id)
+
+    return (
+        _RoutingClient(direct_sync, bf_sync, nexus_api_key),
+        _RoutingClient(direct_async, bf_async, nexus_api_key),
+    )
 
 
 def mint_flow_session(system_message_content: str) -> tuple[str, list, str | None]:

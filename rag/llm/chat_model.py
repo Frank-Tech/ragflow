@@ -110,93 +110,25 @@ def _apply_model_family_policies(
     return sanitized_gen_conf, sanitized_kwargs
 
 
-def _inject_langfuse_trace_id(client, trace_id_var):
-    """Wrap a langfuse.openai client to auto-inject trace_id from ContextVar.
-
-    The langfuse.openai wrapper accepts ``trace_id`` as a kwarg on
-    ``.chat.completions.create()``.  Without it, each LLM call creates its
-    own Langfuse trace.  With it, all calls share one trace — which is what
-    lexus-test needs to poll a single client trace per flow execution.
-    """
-    orig_create = client.chat.completions.create
-    if asyncio.iscoroutinefunction(orig_create):
-        async def _traced(*args, **kwargs):
-            tid = trace_id_var.get()
-            if tid and "trace_id" not in kwargs:
-                kwargs["trace_id"] = tid
-            return await orig_create(*args, **kwargs)
-    else:
-        def _traced(*args, **kwargs):
-            tid = trace_id_var.get()
-            if tid and "trace_id" not in kwargs:
-                kwargs["trace_id"] = tid
-            return orig_create(*args, **kwargs)
-    client.chat.completions.create = _traced
-
-
 class Base(ABC):
     def __init__(self, key, model_name, base_url, **kwargs):
         timeout = int(os.environ.get("LLM_TIMEOUT_SECONDS", 600))
-        # ── babelfish routing (lexus-test integration) ──────────────────────
-        # When the babelfish adapter is active and mode == "babelfish", route
-        # every OpenAI call through the nexus proxy instead of the provider's
-        # base_url, and inject the babelfish headers so holy-grail can tag the
-        # resulting trace to the correct flow/session. The adapter sets
-        # babelfish_context in a ContextVar before invoking the Canvas; we
-        # read it here at client construction time. See
-        # babelfish_ragflow_adapter/core/context.py for the protocol.
-        #
-        # CRITICAL: clients must be constructed fresh per invocation (do NOT
-        # memoize at module/class/tenant level) — cached clients would carry
-        # stale X-Session-ID headers from the first run. Any caller that
-        # caches chat model instances across babelfish contexts is a bug.
-        bf_default_headers = None
-        bf_base_url = None
+        # ── babelfish adapter delegation (lexus-test integration) ───────────
+        # When the babelfish adapter is active, it returns routing clients
+        # that gate babelfish-vs-direct per call, on system-message hash.
+        # When inactive (or not installed), fall back to plain OpenAI.
+        # See ``babelfish_ragflow_adapter/core/context.py:build_chat_clients``
+        # for the routing semantics and header-injection contract.
+        _bf_clients = None
         try:
-            from babelfish_ragflow_adapter.core.context import (
-                babelfish_context as _bf_ctx,
-                _current_session_id as _current_sid,
-                _current_flow_id as _current_fid,
-                _current_client_trace_id as _current_tid,
+            from babelfish_ragflow_adapter.core.context import build_chat_clients
+            _bf_clients = build_chat_clients(
+                api_key=key, provider_base_url=base_url, timeout=timeout,
             )
-            ctx = _bf_ctx.get()
-            if ctx and ctx.get("mode") == "babelfish":
-                bf_base_url = os.environ["OPENAI_BASE_URL"]
-                bf_default_headers = {
-                    "X-Session-ID": _current_sid.get() or "",
-                    "X-Flow-ID": _current_fid.get() or ctx["flow_id"],
-                    "X-Api-Key": os.environ["NEXUS_API_KEY"],
-                    "X-Auto-Approve": "true",
-                }
         except ImportError:
-            # babelfish_ragflow_adapter isn't installed → ragflow runs normally.
-            _current_tid = None
             pass
-        # ────────────────────────────────────────────────────────────────────
-        if bf_default_headers is not None:
-            # Use langfuse's drop-in OpenAI wrapper for auto-tracing.
-            # Every completion is captured as a GENERATION observation on
-            # the client Langfuse trace. Falls back to plain OpenAI if
-            # langfuse.openai isn't available.
-            _OAI, _AOAI = OpenAI, AsyncOpenAI
-            _has_langfuse = False
-            try:
-                from langfuse.openai import OpenAI as _LfOAI, AsyncOpenAI as _LfAOAI
-                _OAI, _AOAI = _LfOAI, _LfAOAI
-                _has_langfuse = True
-            except ImportError:
-                pass
-            self.client = _OAI(
-                api_key=key, base_url=bf_base_url, timeout=timeout,
-                default_headers=bf_default_headers,
-            )
-            self.async_client = _AOAI(
-                api_key=key, base_url=bf_base_url, timeout=timeout,
-                default_headers=bf_default_headers,
-            )
-            if _has_langfuse and _current_tid is not None:
-                _inject_langfuse_trace_id(self.client, _current_tid)
-                _inject_langfuse_trace_id(self.async_client, _current_tid)
+        if _bf_clients is not None:
+            self.client, self.async_client = _bf_clients
         else:
             self.client = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
             self.async_client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout)
