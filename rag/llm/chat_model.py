@@ -1374,11 +1374,7 @@ class LiteLLMBase(ABC):
 
         for attempt in range(self.max_retries + 1):
             try:
-                response = await litellm.acompletion(
-                    **completion_args,
-                    drop_params=True,
-                    timeout=self.timeout,
-                )
+                response = await self._acompletion(completion_args)
 
                 if any([not response.choices, not response.choices[0].message, not response.choices[0].message.content]):
                     return "", 0
@@ -1409,11 +1405,7 @@ class LiteLLMBase(ABC):
 
         for attempt in range(self.max_retries + 1):
             try:
-                stream = await litellm.acompletion(
-                    **completion_args,
-                    drop_params=True,
-                    timeout=self.timeout,
-                )
+                stream = await self._acompletion(completion_args)
 
                 async for resp in stream:
                     if not hasattr(resp, "choices") or not resp.choices:
@@ -1570,11 +1562,7 @@ class LiteLLMBase(ABC):
                     logging.info(f"{self.tools=}")
 
                     completion_args = self._construct_completion_args(history=history, stream=False, tools=True, **gen_conf)
-                    response = await litellm.acompletion(
-                        **completion_args,
-                        drop_params=True,
-                        timeout=self.timeout,
-                    )
+                    response = await self._acompletion(completion_args)
 
                     tk_count += total_token_count_from_response(response)
 
@@ -1650,11 +1638,7 @@ class LiteLLMBase(ABC):
                     logging.info(f"[ToolLoop] round={_round} model={self.model_name} tools={[t['function']['name'] for t in tools]}")
 
                     completion_args = self._construct_completion_args(history=history, stream=True, tools=True, **gen_conf)
-                    response = await litellm.acompletion(
-                        **completion_args,
-                        drop_params=True,
-                        timeout=self.timeout,
-                    )
+                    response = await self._acompletion(completion_args)
 
                     final_tool_calls = {}
                     answer = ""
@@ -1743,11 +1727,7 @@ class LiteLLMBase(ABC):
                 history.append({"role": "user", "content": f"Exceed max rounds: {self.max_rounds}"})
 
                 completion_args = self._construct_completion_args(history=history, stream=True, tools=True, **gen_conf)
-                response = await litellm.acompletion(
-                    **completion_args,
-                    drop_params=True,
-                    timeout=self.timeout,
-                )
+                response = await self._acompletion(completion_args)
 
                 async for resp in response:
                     if not hasattr(resp, "choices") or not resp.choices:
@@ -1773,6 +1753,35 @@ class LiteLLMBase(ABC):
                     return
 
         assert False, "Shouldn't be here."
+
+    async def _acompletion(self, completion_args: dict):
+        # Route around litellm when a langfuse.openai-wrapped client is attached.
+        # litellm.acompletion(client=<wrapped>) reaches past the wrapper into httpx
+        # and consumes the response itself, so the wrapper's Completions.create
+        # instrumentation never fires — every Langfuse GENERATION ends up with
+        # output: None (including tool_calls). Calling the wrapped client directly
+        # fires the hook and captures both request and response. See
+        # _construct_completion_args() for where `client` is installed (only when
+        # babelfish_context is active).
+        # Copy so callers that re-issue across retries see a stable dict.
+        args = dict(completion_args)
+        client = args.pop("client", None)
+        if client is None:
+            return await litellm.acompletion(
+                **args,
+                drop_params=True,
+                timeout=self.timeout,
+            )
+        for k in ("api_key", "api_base", "num_retries"):
+            args.pop(k, None)
+        args.setdefault("timeout", self.timeout)
+        # litellm uses "<provider>/<model>" namespacing (e.g. "openai/gpt-4o")
+        # and strips the prefix before the HTTP call. The raw OpenAI API
+        # rejects it with 400 invalid model ID, so strip it here too.
+        model = args.get("model")
+        if isinstance(model, str) and "/" in model:
+            args["model"] = model.split("/", 1)[1]
+        return await client.chat.completions.create(**args)
 
     def _construct_completion_args(self, history, stream: bool, tools: bool, **kwargs):
         completion_args = {
